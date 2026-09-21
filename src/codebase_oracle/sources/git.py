@@ -121,7 +121,9 @@ def _one_commit(unit: str, record: str) -> Iterator[EventRow]:
     fields = record.split(_FLD)
     if len(fields) < 7:
         return
-    sha, ts_a, ts_c, an, _ae, parents, tail = fields[:7]
+    # `parent_shas`, not `parents` — the inner row() builder takes a `parents` keyword and
+    # shadowing it here is how the str/int confusion in the numstat loop happened.
+    sha, ts_a, ts_c, an, _ae, parent_shas, tail = fields[:7]
     sha = sha.strip()
     if not sha:
         return
@@ -153,6 +155,7 @@ def _one_commit(unit: str, record: str) -> Iterator[EventRow]:
         deletions: int = 0,
         from_sha: str = "",
         to_sha: str = "",
+        parents: str = "",
     ) -> EventRow:
         """Every field named explicitly — no dict, no **kwargs.
 
@@ -178,9 +181,15 @@ def _one_commit(unit: str, record: str) -> Iterator[EventRow]:
             deletions=deletions,
             from_sha=from_sha,
             to_sha=to_sha,
+            parents=parents,
+            sha_repo="",
+            gh_event="",
         )
 
-    yield row(uid=commit_id(unit, sha), kind="commit", text=body, from_sha=parents.strip())
+    # Parents go in `parents`, NOT `from_sha`. from_sha means "the gitlink's old target"
+    # and nothing else now; overloading it made the commit DAG indistinguishable from a
+    # submodule pointer at read time.
+    yield row(uid=commit_id(unit, sha), kind="commit", text=body, parents=parent_shas.strip())
 
     # numstat carries the line counts, raw carries the modes. Join them by path.
     # Distinct names per loop. The earlier version bound `add, dele` as strings from

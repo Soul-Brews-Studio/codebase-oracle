@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .gitio import GitError, git
+from .graph import Adjacency, commit_node, contradictions, issue_states
 from .indexer import ensure_excluded, run_index, store_dir
 from .store import Store, sql_str
 from .time import local_date_time, zone_offset
@@ -49,6 +50,13 @@ class Opts:
     kinds: tuple[str, ...] = field(default_factory=tuple)
     # show
     uid: str = ""
+    # graph / ancestry
+    node: str = ""
+    against: str = ""
+    depth: int = 1
+    dot: bool = False
+    count: bool = False
+    trusted: bool = False
 
 
 def opts(a: argparse.Namespace) -> Opts:
@@ -68,6 +76,12 @@ def opts(a: argparse.Namespace) -> Opts:
         limit=int(g("limit") or 0),
         kinds=tuple(str(k) for k in kind),
         uid=str(g("uid") or ""),
+        node=str(g("node") or ""),
+        against=str(g("against") or ""),
+        depth=int(g("depth") or 1),
+        dot=bool(g("dot", False)),
+        count=bool(g("count", False)),
+        trusted=bool(g("trusted", False)),
     )
 
 
@@ -155,8 +169,13 @@ def cmd_status(o: Opts) -> int:
 
 def cmd_search(o: Opts) -> int:
     _, store = _store(o)
-    where = f"unit = '{sql_str(o.unit)}'" if o.unit else ""
-    hits = store.search(o.query, limit=o.limit, where=where)
+    clauses = []
+    if o.unit:
+        clauses.append(f"unit = '{sql_str(o.unit)}'")
+    if o.until:
+        # Lexical comparison is valid because to_utc_iso normalises every stamp to +00:00.
+        clauses.append(f"ts_commit <= '{sql_str(o.until)}'")
+    hits = store.search(o.query, limit=o.limit, where=" AND ".join(clauses))
     lines: list[str] = []
     for h in hits:
         lines.append(
@@ -194,7 +213,7 @@ def cmd_show(o: Opts) -> int:
         return 1
     # Neighbours scan the unit and sort in Python. Fine per-codebase; if this ever
     # matters, the fix is a range filter around ts_commit, not an index.
-    siblings = store.range(unit=str(ev["unit"]), limit=0)
+    siblings = store.range(unit=str(ev["unit"]), until=o.until, limit=0)
     idx = next((i for i, r in enumerate(siblings) if r["uid"] == ev["uid"]), -1)
     window = siblings[max(0, idx - 3) : idx + 4] if idx >= 0 else [ev]
 
@@ -224,6 +243,105 @@ def cmd_show(o: Opts) -> int:
     return _emit(o, {"event": ev, "neighbours": window}, lines)
 
 
+def _resolve_node(o: Opts, root: str, ref: str) -> str:
+    """Accept a full node id, a raw sha, or anything `git rev-parse` understands.
+
+    Typing `cbo ancestry HEAD` has to work, or the command is unusable in practice.
+    """
+    if ":" in ref:
+        return ref
+    unit = o.unit or "."
+    cwd = root if unit == "." else os.path.join(root, unit)
+    sha = git(cwd, "rev-parse", ref, check=False) or ref
+    return commit_node(unit, sha)
+
+
+def cmd_ancestry(o: Opts) -> int:
+    root, store = _store(o)
+    adj = Adjacency.load(store, until=o.until)
+    node = _resolve_node(o, root, o.node)
+
+    if o.against:
+        other = _resolve_node(o, root, o.against)
+        reach = adj.between(other, node)
+        label = f"in {o.node} but not {o.against}"
+    else:
+        reach = adj.ancestors(node)
+        label = f"ancestors of {o.node} (including itself)"
+
+    if o.count:
+        return _emit(o, {"count": len(reach), "node": node}, [str(len(reach))])
+
+    ordered = sorted(reach.items(), key=lambda kv: kv[1])
+    lines = [f"{label}: {len(reach)}", ""]
+    for n, d in ordered[: o.limit]:
+        lines.append(f"  {d:>4}  {n}")
+    if len(ordered) > o.limit:
+        lines.append(f"  … {len(ordered) - o.limit} more (--limit)")
+    return _emit(o, {"node": node, "count": len(reach), "nodes": ordered}, lines)
+
+
+def cmd_graph(o: Opts) -> int:
+    root, store = _store(o)
+    adj = Adjacency.load(store, until=o.until)
+    node = _resolve_node(o, root, o.node)
+    states = issue_states(store, until=o.until)
+
+    reach = adj.walk(node, depth=o.depth, trusted_only=o.trusted)
+    edges = [e for e in adj.neighbours(node) if not (o.trusted and not e.trusted)]
+
+    if o.dot:
+        lines = ["digraph cbo {", '  rankdir=LR;', '  node [shape=box fontname="monospace"];']
+        for n in reach:
+            lines.append(f'  "{n}";')
+        for n in reach:
+            for e in adj.fwd.get(n, ()):
+                if e.dst in reach and not (o.trusted and not e.trusted):
+                    lines.append(f'  "{e.src}" -> "{e.dst}" [label="{e.kind}"];')
+        lines.append("}")
+        return _emit(o, {"node": node, "reached": len(reach)}, lines)
+
+    lines = [node, ""]
+    for i, e in enumerate(edges):
+        last = i == len(edges) - 1
+        stem = "└─" if last else "├─"
+        far = e.dst if e.src == node else e.src
+        arrow = "→" if e.src == node else "←"
+        warn = ""
+        if e.kind == "closes" and states.get(e.dst) != "closed":
+            # The contradiction surfaced where you are already looking.
+            warn = "  ⚠ issue not closed" if states.get(e.dst) else "  ⚠ gh not indexed"
+        lines.append(f"  {stem} {e.kind:<15} {arrow} {far}  [{e.source}]{warn}")
+    if not edges:
+        lines.append("  no edges — no link found (which is not the same as no relationship)")
+    lines += ["", f"  {len(reach) - 1} nodes within depth {o.depth}"]
+    return _emit(o, {"node": node, "edges": [vars(e) for e in edges]}, lines)
+
+
+def cmd_contradictions(o: Opts) -> int:
+    _, store = _store(o)
+    adj = Adjacency.load(store, until=o.until)
+    found = contradictions(store, adj, until=o.until)
+
+    real = [c for c in found if c.verdict == "still-open"]
+    unknown = [c for c in found if c.verdict == "gh-not-indexed"]
+    lines = [f"claimed closed but still open: {len(real)}", ""]
+    for c in real:
+        lines.append(
+            f"  {local_date_time(c.claimed_at)}  {c.commit.split(':')[-1][:8]}  "
+            f"→ {c.issue.split(':')[-1]:>5}   {c.subject[:58]}"
+        )
+    if unknown:
+        lines += [
+            "",
+            f"  {len(unknown)} claim(s) unverifiable — those issues have no indexed",
+            "  transitions. Run `cbo index` with GitHub access; missing data is not a finding.",
+        ]
+    if not found:
+        lines.append("  none")
+    return _emit(o, [vars(c) for c in found], lines)
+
+
 def cmd_exclude(o: Opts) -> int:
     """Not one of the five — a repair hatch for when the exclude line went missing."""
     root = _root(o)
@@ -240,6 +358,9 @@ COMMANDS: dict[str, Callable[[Opts], int]] = {
     "search": cmd_search,
     "timeline": cmd_timeline,
     "show": cmd_show,
+    "ancestry": cmd_ancestry,
+    "graph": cmd_graph,
+    "contradictions": cmd_contradictions,
     "exclude": cmd_exclude,
 }
 
@@ -269,6 +390,7 @@ def build_parser() -> argparse.ArgumentParser:
     x = sub.add_parser("search", parents=[common], help="full-text search the log")
     x.add_argument("query")
     x.add_argument("--unit", default="")
+    x.add_argument("--until", default="")
     x.add_argument("--limit", type=int, default=20)
 
     x = sub.add_parser("timeline", parents=[common], help="merged chronological view")
@@ -280,6 +402,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     x = sub.add_parser("show", parents=[common], help="one event and its neighbours")
     x.add_argument("uid")
+    x.add_argument("--until", default="")
+
+    x = sub.add_parser("ancestry", parents=[common], help="walk the commit DAG")
+    x.add_argument("node", help="sha, HEAD, or a full node id")
+    x.add_argument("--against", default="", help="show what is in node but not this")
+    x.add_argument("--unit", default="")
+    x.add_argument("--until", default="")
+    x.add_argument("--count", action="store_true")
+    x.add_argument("--limit", type=int, default=20)
+
+    x = sub.add_parser("graph", parents=[common], help="a node's neighbourhood")
+    x.add_argument("node")
+    x.add_argument("--unit", default="")
+    x.add_argument("--until", default="")
+    x.add_argument("--depth", type=int, default=1)
+    x.add_argument("--trusted", action="store_true",
+                   help="exclude regex-derived edges")
+    x.add_argument("--dot", action="store_true", help="Graphviz output")
+
+    x = sub.add_parser("contradictions", parents=[common],
+                       help="commits claiming to close an issue that never closed")
+    x.add_argument("--until", default="")
 
     sub.add_parser("exclude", parents=[common],
                    help="re-register the store in .git/info/exclude")

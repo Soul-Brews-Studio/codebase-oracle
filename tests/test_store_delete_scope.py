@@ -24,6 +24,7 @@ def _ev(uid: str, kind: str, unit: str = ".") -> EventRow:
         sha="abc", path="", text=uid,
         author_human="Nat", author_agent="", author_model="",
         refs="", number=0, insertions=0, deletions=0, from_sha="", to_sha="",
+        parents="", sha_repo="", gh_event="",
     )
 
 

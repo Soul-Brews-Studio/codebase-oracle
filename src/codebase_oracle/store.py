@@ -30,6 +30,50 @@ def sql_str(v: str) -> str:
     return v.replace("'", "''")
 
 
+# Arrow type -> the SQL literal `add_columns` backfills with. The CAST is not optional:
+# a bare `0` lands as int32 and the column then disagrees with the model, which is what
+# the schema-vs-disk test exists to catch.
+#
+# These are Lance's OWN type names, not standard SQL. `VARCHAR` is rejected outright —
+# "Unsupported data type: Varchar(None)" — and the accepted set is string / bigint / int /
+# double / boolean / binary / date / timestamp / decimal.
+_BACKFILL = {
+    "string": "CAST('' AS string)",
+    "large_string": "CAST('' AS string)",
+    "int64": "CAST(0 AS bigint)",
+    "int32": "CAST(0 AS int)",
+    "double": "CAST(0.0 AS double)",
+    "bool": "CAST(false AS boolean)",
+}
+
+
+def _widen(table: Any, model: Any) -> list[str]:
+    """Add columns the model has and the table does not. Returns what was added.
+
+    `merge_insert` does NOT auto-widen — it rejects the whole batch with
+    `Field '<name>' not found in target schema`. So a new field makes every subsequent
+    write fail, including `index --full`, which cannot repair it either because it also
+    merges into the existing table. Without this the only recovery is deleting the store.
+
+    Widening never removes or retypes anything, so it cannot lose data. A column the
+    table has and the model lost is left alone, and the schema test flags that separately
+    as the model being behind disk.
+    """
+    have = {f.name for f in table.schema}
+    added: list[str] = []
+    for field in model.to_arrow_schema():
+        if field.name in have:
+            continue
+        literal = _BACKFILL.get(str(field.type))
+        if literal is None:
+            raise RuntimeError(
+                f"cannot widen {field.name}: no backfill literal for {field.type}"
+            )
+        table.add_columns({field.name: literal})
+        added.append(field.name)
+    return added
+
+
 def _rows(query: Any) -> list[Row]:
     """Materialise an untyped Lance query into plain dicts.
 
@@ -193,6 +237,7 @@ class Store:
         if t is None:
             self.db.create_table(name, data=data, schema=model.to_arrow_schema())
             return len(data)
+        _widen(t, model)
         (
             t.merge_insert(key)
             .when_matched_update_all()
