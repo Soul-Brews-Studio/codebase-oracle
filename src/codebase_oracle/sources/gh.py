@@ -18,6 +18,7 @@ definition.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from collections.abc import Iterator
@@ -114,6 +115,7 @@ def read(unit: str, repo: str, since: str = "") -> Iterator[EventRow]:
             ts=opened_at,
             actor=(issue.get("user") or {}).get("login", ""),
             text=f"opened: {title}\n\n{issue.get('body') or ''}".strip(),
+            event="opened",
         )
 
         for ev in _api_lines(f"/repos/{repo}/issues/{number}/timeline?per_page=100"):
@@ -122,6 +124,7 @@ def read(unit: str, repo: str, since: str = "") -> Iterator[EventRow]:
                 continue
             ev_id = str(ev.get("id") or ev.get("node_id") or f"{name}:{ev.get('created_at')}")
             actor = (ev.get("actor") or ev.get("user") or {}).get("login", "")
+            sha = ev.get("commit_id") or ""
             yield _row(
                 uid=gh_event_id(repo, number, ev_id),
                 unit=unit,
@@ -130,7 +133,9 @@ def read(unit: str, repo: str, since: str = "") -> Iterator[EventRow]:
                 ts=to_utc_iso(ev.get("created_at") or ev.get("submitted_at")),
                 actor=actor,
                 text=_text(name, title, ev),
-                sha=ev.get("commit_id") or "",
+                sha=sha,
+                sha_repo=_sha_repo(ev, repo) if sha else "",
+                event=name,
             )
 
 
@@ -145,6 +150,24 @@ def _text(name: str, title: str, ev: dict) -> str:
     return f"{name}: {title}"
 
 
+_COMMIT_URL = re.compile(r"/repos/(?P<repo>[^/]+/[^/]+)/commits/")
+
+
+def _sha_repo(ev: dict, repo: str) -> str:
+    """Which repository the event's `commit_id` actually belongs to.
+
+    A `referenced` event can name a sha from a completely different repository — someone
+    mentions this issue from another project. The sha then has no node in this codebase's
+    index, and an edge pointing at `git:.:<sha>` would dangle forever with no way to tell
+    "not indexed yet" from "belongs to someone else". `commit_url` carries the answer.
+
+    Empty means local: the sha belongs to the repo we are indexing.
+    """
+    m = _COMMIT_URL.search(ev.get("commit_url") or "")
+    found = m["repo"] if m else ""
+    return "" if not found or found == repo else found
+
+
 def _row(
     *,
     uid: str,
@@ -155,6 +178,8 @@ def _row(
     actor: str,
     text: str,
     sha: str = "",
+    sha_repo: str = "",
+    event: str = "",
 ) -> EventRow:
     # A GitHub event has ONE timestamp, so author-time and record-time genuinely
     # coincide. Both columns are filled so that ordering and range filters work
@@ -177,4 +202,7 @@ def _row(
         deletions=0,
         from_sha="",
         to_sha="",
+        parents="",
+        sha_repo=sha_repo,
+        gh_event=event,
     )

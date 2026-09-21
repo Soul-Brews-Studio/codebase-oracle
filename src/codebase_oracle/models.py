@@ -40,6 +40,36 @@ WATERMARKS = "watermarks"
 GIT_KINDS: tuple[str, ...] = ("commit", "file-change", "submodule-bump")
 GH_KINDS: tuple[str, ...] = ("issue-transition", "pr-transition")
 
+# Edge vocabulary. PROV-O names where the standard has one — they are peer-reviewed and
+# unambiguous, and give free alignment if this is ever exported — plain verbs otherwise.
+EdgeKind = Literal[
+    "wasDerivedFrom",   # commit -> parent commit
+    "touched",          # commit -> file
+    "bumped",           # commit -> submodule range
+    "resolves",         # commit -> issue, GitHub resolved the keyword
+    "merged_as",        # pr -> commit
+    "mentions",         # commit -> issue, our regex found "#N"
+    "wasAttributedTo",  # commit -> agent
+]
+
+# HOW an edge was derived, which is the only honest form of confidence. A float would be
+# decoration: nothing consumes it, and it goes stale the day the extraction improves.
+# Precision is a property of the method, so the method is what gets recorded.
+EdgeSource = Literal[
+    "parent",       # exact — from the commit's own parent list
+    "file-change",  # exact — from a file-change row
+    "gitlink",      # exact — from a gitlink diff
+    "gh-closed",    # high — GitHub resolved a closing keyword
+    "gh-merged",    # high — GitHub recorded the merge
+    "trailer",      # high — Co-Authored-By
+    "regex-hash",   # ~0.60 precision — our own "#N" scan, must be discounted
+]
+
+# Only these two are trustworthy enough to accuse anyone with. Issue-to-commit link
+# recovery caps around 0.60 precision by heuristic, so a contradiction built on
+# regex-hash would be a false accusation roughly 40% of the time.
+TRUSTED_SOURCES: tuple[str, ...] = ("gh-closed", "gh-merged")
+
 STORE_DIRNAME = ".codebase-oracle"
 
 
@@ -78,6 +108,22 @@ class EventRow(LanceModel):
     # submodule-bump only: the gitlink's old and new target.
     from_sha: str
     to_sha: str
+    # Space-joined parent shas on commit events. APPENDED rather than carved out of
+    # from_sha, which used to hold both parents and gitlink targets — one column, two
+    # meanings. Renaming a field does not raise; it silently creates a second column and
+    # leaves the old one holding the only data there was. So from_sha keeps its name and
+    # its gitlink meaning, and commits get their own column.
+    parents: str
+    # For a gh event whose commit_id belongs to a DIFFERENT repository — a
+    # `referenced` transition can name a sha this codebase has never seen. Empty when
+    # the sha is local. Without it a cross-repo edge points at a node that cannot exist.
+    sha_repo: str
+    # The GitHub timeline event name: closed, merged, referenced, commented, labeled…
+    # `kind` only says issue-transition vs pr-transition, and edge derivation needs the
+    # distinction: `closed` carrying a commit_id is GitHub resolving a keyword, while
+    # `referenced` carrying one is merely a mention. Its own column rather than parsed
+    # back out of `text`.
+    gh_event: str
 
 
 class UnitRow(LanceModel):

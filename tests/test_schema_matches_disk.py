@@ -37,7 +37,15 @@ from codebase_oracle.units import codebase_root  # noqa: E402
 MODELS: dict[str, Any] = {EVENTS: EventRow, UNITS: UnitRow, WATERMARKS: WatermarkRow}
 
 # Fields the model has and disk does not, pending a lazy widen on next write.
-PENDING_MIGRATION: dict[str, set[str]] = {}
+#
+# These three landed with the graph work and are ahead of any store written before it.
+# `parents` split the commit DAG out of `from_sha`, which meant both parent shas and
+# gitlink targets; `sha_repo` marks a commit_id belonging to another repository;
+# `gh_event` keeps the timeline event name that edge derivation needs. A re-index with
+# `--full` brings disk level again, at which point these can be removed.
+PENDING_MIGRATION: dict[str, set[str]] = {
+    EVENTS: {"parents", "sha_repo", "gh_event"},
+}
 
 
 def _disk(table: str) -> dict[str, str]:
