@@ -15,16 +15,29 @@ so the gap only widens here.
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Sequence
+from collections.abc import Iterable, Sequence
+from typing import Any
 
 import lancedb
 
 from .models import EVENTS, UNITS, WATERMARKS, EventRow, UnitRow, WatermarkRow
 
+Row = dict[str, Any]
+
 
 def sql_str(v: str) -> str:
     """Quote a value for a Lance filter. Filters are SQL strings, so this is required."""
     return v.replace("'", "''")
+
+
+def _rows(query: Any) -> list[Row]:
+    """Materialise an untyped Lance query into plain dicts.
+
+    One conversion point, for the same reason there is one clock: a result that stays
+    `Any` spreads silently through every caller, and then the checker is only pretending
+    to check them.
+    """
+    return [dict(r) for r in query.to_list()]
 
 
 class Store:
@@ -35,8 +48,12 @@ class Store:
 
     # --------------------------------------------------------------- read side
 
-    def _existing(self, name: str):
+    def _existing(self, name: str) -> Any:
         """The table, or None. NEVER creates.
+
+        Returns `Any` because lancedb ships no type information. This annotation is the
+        declared edge of the typed world: everything a table hands back is converted at
+        the boundary (see `_rows`), so `Any` does not leak past this class.
 
         Two traps in one call. `list_tables()` returns a ListTablesResponse, not a
         list of strings, so `name not in self.db.list_tables()` is False for every
@@ -63,7 +80,7 @@ class Store:
         if t is None:
             return 0
         try:
-            return t.count_rows(where) if where else t.count_rows()
+            return int(t.count_rows(where) if where else t.count_rows())
         except Exception:
             return 0
 
@@ -72,29 +89,29 @@ class Store:
         if t is None:
             return {}
         out: dict[str, int] = {}
-        for row in t.search().select(["kind"]).limit(0).to_list():
+        for row in _rows(t.search().select(["kind"]).limit(0)):
             out[row["kind"]] = out.get(row["kind"], 0) + 1
         return out
 
-    def units(self) -> list[dict]:
+    def units(self) -> list[Row]:
         t = self._existing(UNITS)
         if t is None:
             return []
-        return sorted(t.search().limit(0).to_list(), key=lambda r: r["unit"])
+        return sorted(_rows(t.search().limit(0)), key=lambda r: str(r["unit"]))
 
-    def watermark(self, unit: str, source: str) -> dict | None:
+    def watermark(self, unit: str, source: str) -> Row | None:
         t = self._existing(WATERMARKS)
         if t is None:
             return None
         key = sql_str(f"{unit}:{source}")
-        rows = t.search().where(f"key = '{key}'").limit(2).to_list()
+        rows = _rows(t.search().where(f"key = '{key}'").limit(2))
         return rows[0] if rows else None
 
-    def event(self, uid: str) -> dict | None:
+    def event(self, uid: str) -> Row | None:
         t = self._existing(EVENTS)
         if t is None:
             return None
-        rows = t.search().where(f"uid = '{sql_str(uid)}'").limit(2).to_list()
+        rows = _rows(t.search().where(f"uid = '{sql_str(uid)}'").limit(2))
         return rows[0] if rows else None
 
     def range(
@@ -104,7 +121,7 @@ class Store:
         unit: str = "",
         kinds: Sequence[str] = (),
         limit: int = 200,
-    ) -> list[dict]:
+    ) -> list[Row]:
         """Events in a window, chronological.
 
         String comparison on `ts_commit` is valid only because time.to_utc_iso
@@ -127,11 +144,11 @@ class Store:
         q = t.search()
         if clauses:
             q = q.where(" AND ".join(clauses))
-        rows = q.limit(0).to_list()
+        rows = _rows(q.limit(0))
         rows.sort(key=lambda r: (r.get("ts_commit") or "", r.get("uid") or ""))
         return rows[:limit] if limit else rows
 
-    def search(self, query: str, limit: int = 20, where: str = "") -> list[dict]:
+    def search(self, query: str, limit: int = 20, where: str = "") -> list[Row]:
         """FTS, falling back to LIKE.
 
         A shard whose FTS index failed to build must still answer. The fallback is
@@ -145,16 +162,16 @@ class Store:
             q = t.search(query, query_type="fts")
             if where:
                 q = q.where(where)
-            return q.limit(limit).to_list()
+            return _rows(q.limit(limit))
         except Exception:
             q = t.search().where(
                 f"text LIKE '%{sql_str(query)}%'" + (f" AND ({where})" if where else "")
             )
-            return q.limit(limit).to_list()
+            return _rows(q.limit(limit))
 
     # -------------------------------------------------------------- write side
 
-    def _merge(self, name: str, model: Any, key: str, rows: Iterable) -> int:
+    def _merge(self, name: str, model: Any, key: str, rows: Iterable[Any]) -> int:
         """Upsert by `key`, creating the table on first write.
 
         merge_insert REJECTS THE WHOLE BATCH when two source rows share a key
@@ -168,7 +185,7 @@ class Store:
         data = [r.model_dump() for r in rows]
         if not data:
             return 0
-        seen: dict[str, dict] = {}
+        seen: dict[str, Row] = {}
         for d in data:
             seen[d[key]] = d
         data = list(seen.values())
@@ -193,12 +210,19 @@ class Store:
     def put_watermarks(self, rows: Iterable[WatermarkRow]) -> int:
         return self._merge(WATERMARKS, WatermarkRow, "key", rows)
 
-    def delete_unit_events(self, unit: str) -> None:
-        """Drop a unit's rows before a full re-read, or two generations coexist."""
+    def delete_unit_events(self, unit: str, kinds: Sequence[str]) -> None:
+        """Drop one unit's rows for the named kinds, before that source is re-read.
+
+        `kinds` is required, not optional. Deleting a whole unit meant `--full --no-gh`
+        cleared the GitHub transitions and then re-read only git, silently destroying
+        data the run never intended to touch — observed for real on a repo that had 233
+        indexed transitions. A full re-read must only clear what it is about to rewrite.
+        """
         t = self._existing(EVENTS)
-        if t is None:
+        if t is None or not kinds:
             return
-        t.delete(f"unit = '{sql_str(unit)}'")
+        inner = ", ".join(f"'{sql_str(k)}'" for k in kinds)
+        t.delete(f"unit = '{sql_str(unit)}' AND kind IN ({inner})")
 
     def ensure_fts_index(self) -> None:
         t = self._existing(EVENTS)

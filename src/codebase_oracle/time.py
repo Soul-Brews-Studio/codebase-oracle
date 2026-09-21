@@ -13,10 +13,12 @@ is derived from the other.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Union
+from datetime import UTC, datetime
 
-Stamp = Union[str, int, float, None]
+# A runtime alias, not an annotation, so `from __future__ import annotations` does not
+# defer it — the `|` form is evaluated at import and needs 3.10+, which requires-python
+# already guarantees.
+Stamp = str | int | float | None
 
 
 def _dt(v: Stamp) -> datetime | None:
@@ -25,7 +27,7 @@ def _dt(v: Stamp) -> datetime | None:
         return None
     if isinstance(v, (int, float)):
         # Milliseconds and seconds are indistinguishable without a magnitude test.
-        return datetime.fromtimestamp(v / 1000 if v > 1e11 else v, timezone.utc)
+        return datetime.fromtimestamp(v / 1000 if v > 1e11 else v, UTC)
     try:
         return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except ValueError:
@@ -43,8 +45,8 @@ def to_utc_iso(v: Stamp) -> str:
     if d is None:
         return ""
     if d.tzinfo is None:
-        d = d.replace(tzinfo=timezone.utc)
-    return d.astimezone(timezone.utc).isoformat(timespec="seconds")
+        d = d.replace(tzinfo=UTC)
+    return d.astimezone(UTC).isoformat(timespec="seconds")
 
 
 def local_date_time(v: Stamp) -> str:
@@ -63,7 +65,7 @@ def local_time(v: Stamp) -> str:
 
 
 def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def zone_offset() -> str:

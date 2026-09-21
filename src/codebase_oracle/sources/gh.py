@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from typing import Iterator
+from collections.abc import Iterator
 
 from ..ids import gh_event_id
 from ..models import EventRow

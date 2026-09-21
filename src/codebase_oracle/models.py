@@ -35,6 +35,11 @@ EVENTS = "events"
 UNITS = "units"
 WATERMARKS = "watermarks"
 
+# Which kinds each source owns. A full re-read clears only its own source's kinds, so
+# re-indexing git cannot delete GitHub transitions it is not going to rewrite.
+GIT_KINDS: tuple[str, ...] = ("commit", "file-change", "submodule-bump")
+GH_KINDS: tuple[str, ...] = ("issue-transition", "pr-transition")
+
 STORE_DIRNAME = ".codebase-oracle"
 
 

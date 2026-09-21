@@ -9,18 +9,19 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
 from codebase_oracle.units import discover
 
 
-def _git(cwd, *args):
+def _git(cwd: str, *args: str) -> None:
     subprocess.run(["git", "-C", cwd, *args], check=True, capture_output=True)
 
 
 @pytest.fixture
-def superproject(tmp_path):
+def superproject(tmp_path: Path) -> str:
     """A real superproject with one real submodule, built on disk."""
     inner = tmp_path / "inner"
     inner.mkdir()
@@ -44,20 +45,20 @@ def superproject(tmp_path):
     return str(outer)
 
 
-def test_submodule_git_is_a_file_not_a_directory(superproject):
+def test_submodule_git_is_a_file_not_a_directory(superproject: str) -> None:
     """The premise of the bug. If this ever fails, git changed and the guard can relax."""
     dotgit = os.path.join(superproject, "vendor", "inner", ".git")
     assert os.path.exists(dotgit)
     assert not os.path.isdir(dotgit), "isdir() would have been a safe check after all"
 
 
-def test_initialised_submodule_is_reported_as_indexable(superproject):
+def test_initialised_submodule_is_reported_as_indexable(superproject: str) -> None:
     units = {u.unit: u for u in discover(superproject)}
     assert "vendor/inner" in units
     assert units["vendor/inner"].initialised is True
 
 
-def test_deinitialised_submodule_degrades_honestly(superproject):
+def test_deinitialised_submodule_degrades_honestly(superproject: str) -> None:
     subprocess.run(
         ["git", "-C", superproject, "submodule", "deinit", "-f", "vendor/inner"],
         check=True, capture_output=True,

@@ -12,16 +12,29 @@ boundary where this reads the transcript index's tables.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import pytest
 
 lancedb = pytest.importorskip("lancedb")
 
-from codebase_oracle.models import EVENTS, UNITS, WATERMARKS, EventRow, UnitRow, WatermarkRow
-from codebase_oracle.indexer import store_dir
-from codebase_oracle.units import codebase_root
+# E402 is correct in general and wrong here: these imports pull in lancedb transitively,
+# so hoisting them above importorskip turns a clean skip on a machine without lancedb
+# into a collection error.
+from codebase_oracle.indexer import store_dir  # noqa: E402
+from codebase_oracle.models import (  # noqa: E402
+    EVENTS,
+    UNITS,
+    WATERMARKS,
+    EventRow,
+    UnitRow,
+    WatermarkRow,
+)
+from codebase_oracle.units import codebase_root  # noqa: E402
 
-MODELS = {EVENTS: EventRow, UNITS: UnitRow, WATERMARKS: WatermarkRow}
+# Any, not type[LanceModel]: lancedb ships no stubs, so mypy resolves the row classes
+# through pydantic's ModelMetaclass and cannot see to_arrow_schema on them.
+MODELS: dict[str, Any] = {EVENTS: EventRow, UNITS: UnitRow, WATERMARKS: WatermarkRow}
 
 # Fields the model has and disk does not, pending a lazy widen on next write.
 PENDING_MIGRATION: dict[str, set[str]] = {}
@@ -39,7 +52,7 @@ def _disk(table: str) -> dict[str, str]:
 
 
 @pytest.mark.parametrize("table", sorted(MODELS))
-def test_model_is_not_behind_disk(table):
+def test_model_is_not_behind_disk(table: str) -> None:
     disk = _disk(table)
     mine = {f.name: str(f.type) for f in MODELS[table].to_arrow_schema()}
     missing = set(disk) - set(mine)
@@ -47,7 +60,7 @@ def test_model_is_not_behind_disk(table):
 
 
 @pytest.mark.parametrize("table", sorted(MODELS))
-def test_model_ahead_of_disk_is_declared(table):
+def test_model_ahead_of_disk_is_declared(table: str) -> None:
     disk = _disk(table)
     mine = {f.name: str(f.type) for f in MODELS[table].to_arrow_schema()}
     ahead = set(mine) - set(disk)
@@ -56,7 +69,7 @@ def test_model_ahead_of_disk_is_declared(table):
 
 
 @pytest.mark.parametrize("table", sorted(MODELS))
-def test_types_match_on_shared_columns(table):
+def test_types_match_on_shared_columns(table: str) -> None:
     disk = _disk(table)
     mine = {f.name: str(f.type) for f in MODELS[table].to_arrow_schema()}
     for name in set(disk) & set(mine):
