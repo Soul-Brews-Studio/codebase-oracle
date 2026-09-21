@@ -46,9 +46,10 @@ EdgeKind = Literal[
     "wasDerivedFrom",   # commit -> parent commit
     "touched",          # commit -> file
     "bumped",           # commit -> submodule range
-    "resolves",         # commit -> issue, GitHub resolved the keyword
+    "resolves",         # commit -> issue, GitHub itself resolved the keyword
+    "closes",           # commit -> issue, the AUTHOR claimed closure. A claim, not a fact
     "merged_as",        # pr -> commit
-    "mentions",         # commit -> issue, our regex found "#N"
+    "mentions",         # commit -> issue, a bare "#N" appeared
     "wasAttributedTo",  # commit -> agent
 ]
 
@@ -56,19 +57,33 @@ EdgeKind = Literal[
 # decoration: nothing consumes it, and it goes stale the day the extraction improves.
 # Precision is a property of the method, so the method is what gets recorded.
 EdgeSource = Literal[
-    "parent",       # exact — from the commit's own parent list
-    "file-change",  # exact — from a file-change row
-    "gitlink",      # exact — from a gitlink diff
-    "gh-closed",    # high — GitHub resolved a closing keyword
-    "gh-merged",    # high — GitHub recorded the merge
-    "trailer",      # high — Co-Authored-By
-    "regex-hash",   # ~0.60 precision — our own "#N" scan, must be discounted
+    "parent",         # exact — from the commit's own parent list
+    "file-change",    # exact — from a file-change row
+    "gitlink",        # exact — from a gitlink diff
+    "gh-closed",      # GitHub resolved a closing keyword
+    "gh-merged",      # GitHub recorded the merge
+    "gh-referenced",  # GitHub resolved a cross-reference — a real link, not a closure
+    "trailer",        # Co-Authored-By
+    "regex-keyword",  # the author WROTE "closes #N" — reliable as intent, not as outcome
+    "regex-hash",     # ~0.60 precision — a bare "#N" we scraped, must be discounted
 ]
 
-# Only these two are trustworthy enough to accuse anyone with. Issue-to-commit link
-# recovery caps around 0.60 precision by heuristic, so a contradiction built on
-# regex-hash would be a false accusation roughly 40% of the time.
-TRUSTED_SOURCES: tuple[str, ...] = ("gh-closed", "gh-merged")
+# Sources reliable enough that the LINK itself can be believed. Everything here was
+# resolved by GitHub or is structurally exact; `regex-*` is our own scraping, which finds
+# at most half the real links at ~0.60 precision.
+#
+# This is about link reliability, NOT about closure. A `gh-referenced` edge is a genuine
+# reference and still says nothing about whether an issue closed — which is why
+# `contradictions` keys off the `closes` edge KIND rather than off trust.
+TRUSTED_SOURCES: tuple[str, ...] = (
+    "parent",
+    "file-change",
+    "gitlink",
+    "gh-closed",
+    "gh-merged",
+    "gh-referenced",
+    "trailer",
+)
 
 STORE_DIRNAME = ".codebase-oracle"
 
