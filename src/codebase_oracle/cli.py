@@ -4,7 +4,12 @@ The `common` parent parser with `default=argparse.SUPPRESS` is load-bearing, not
 decoration. Without a parent, `cbo status --json` exits 2 because the subparser has
 never heard of `--json`. With an ordinary default on the parent, the subparser's default
 overwrites whatever the top-level flag set. SUPPRESS means an absent flag sets no
-attribute at all, so `getattr(a, "json", False)` is the only correct way to read one.
+attribute at all.
+
+That last property is also why `Opts` exists. Reading a SUPPRESSed flag inline means
+`getattr(a, "json", False)` at every use site, against an object mypy only knows as
+`Namespace` — so a mistyped flag name becomes a silent `False` rather than an error.
+The Namespace is converted ONCE, in `opts()`, and nothing downstream touches argparse.
 """
 
 from __future__ import annotations
@@ -13,19 +18,60 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
 
-from .gitio import GitError
+from .gitio import GitError, git
 from .indexer import ensure_excluded, run_index, store_dir
 from .store import Store, sql_str
 from .time import local_date_time, zone_offset
 from .units import RepoNotFound, codebase_root, resolve_repo
 
 
-def _json(a) -> bool:
-    return getattr(a, "json", False)
+@dataclass(frozen=True)
+class Opts:
+    """Every flag this CLI accepts, typed. Built once from the argparse Namespace."""
+
+    json: bool = False
+    path: str = ""
+    repo: str = ""
+    # index
+    no_gh: bool = False
+    full: bool = False
+    # ranges
+    since: str = ""
+    until: str = ""
+    # search / timeline
+    query: str = ""
+    unit: str = ""
+    limit: int = 20
+    kinds: tuple[str, ...] = field(default_factory=tuple)
+    # show
+    uid: str = ""
 
 
-def _root(a) -> str:
+def opts(a: argparse.Namespace) -> Opts:
+    """The single point of contact with argparse's untyped Namespace."""
+    g: Callable[..., Any] = a.__dict__.get
+    kind = g("kind") or []
+    return Opts(
+        json=bool(g("json", False)),
+        path=str(g("path") or ""),
+        repo=str(g("repo") or ""),
+        no_gh=bool(g("no_gh", False)),
+        full=bool(g("full", False)),
+        since=str(g("since") or ""),
+        until=str(g("until") or ""),
+        query=str(g("query") or ""),
+        unit=str(g("unit") or ""),
+        limit=int(g("limit") or 0),
+        kinds=tuple(str(k) for k in kind),
+        uid=str(g("uid") or ""),
+    )
+
+
+def _root(o: Opts) -> str:
     """Which codebase this invocation is about.
 
     `--repo <name>` exists because the common question is asked from somewhere else:
@@ -33,19 +79,18 @@ def _root(a) -> str:
     through the ghq tree and then opens THAT codebase's own store — there is still no
     global index, only a different one.
     """
-    repo = getattr(a, "repo", "") or ""
-    if repo:
-        return codebase_root(resolve_repo(repo))
-    return codebase_root(getattr(a, "path", None) or os.getcwd())
+    if o.repo:
+        return codebase_root(resolve_repo(o.repo))
+    return codebase_root(o.path or os.getcwd())
 
 
-def _store(a) -> tuple[str, Store]:
-    root = _root(a)
+def _store(o: Opts) -> tuple[str, Store]:
+    root = _root(o)
     return root, Store(store_dir(root))
 
 
-def _out(a, payload, lines: list[str]) -> int:
-    if _json(a):
+def _emit(o: Opts, payload: object, lines: list[str]) -> int:
+    if o.json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
         for line in lines:
@@ -53,18 +98,17 @@ def _out(a, payload, lines: list[str]) -> int:
     return 0
 
 
+def _first_line(text: str | None, width: int) -> str:
+    return (text or "").strip().split("\n")[0][:width]
+
+
 # ------------------------------------------------------------------- commands
 
 
-def cmd_index(a) -> int:
-    root = _root(a)
-    summary = run_index(
-        root,
-        with_gh=not getattr(a, "no_gh", False),
-        since=getattr(a, "since", "") or "",
-        full=getattr(a, "full", False),
-    )
-    if _json(a):
+def cmd_index(o: Opts) -> int:
+    root = _root(o)
+    summary = run_index(root, with_gh=not o.no_gh, since=o.since, full=o.full)
+    if o.json:
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
     for u in summary["units"]:
@@ -75,36 +119,30 @@ def cmd_index(a) -> int:
     return 0
 
 
-def cmd_status(a) -> int:
-    root, store = _store(a)
+def cmd_status(o: Opts) -> int:
+    root, store = _store(o)
     if not store.has_index():
         # Deliberately distinct from "indexed, zero events" — see Store._existing.
         print(f"no index at {store_dir(root)} — run: cbo index", file=sys.stderr)
         return 1
 
-    units = store.units()
     kinds = store.counts_by_kind()
-    rows = []
+    rows: list[dict[str, Any]] = []
     lines = [f"codebase  {root}", f"store     {store_dir(root)}", ""]
 
-    for u in units:
-        wm = store.watermark(u["unit"], "git") or {}
-        stale = ""
-        if u["indexed"]:
-            try:
-                from .gitio import git
-
-                head = git(u["path"], "rev-parse", "HEAD", check=False)
-            except GitError:
-                head = ""
-            if head and wm.get("last_sha") and head != wm["last_sha"]:
-                stale = f"  STALE (HEAD {head[:8]} != indexed {wm['last_sha'][:8]})"
-            elif not head:
-                stale = "  unreadable"
+    for u in store.units():
+        note = ""
+        if not u["indexed"]:
+            note = "  not initialised"
         else:
-            stale = "  not initialised"
-        rows.append({**u, "stale": bool(stale.strip())})
-        lines.append(f"  {u['unit']:<28} {u['event_count']:>7} events  {u['url']}{stale}")
+            head = git(str(u["path"]), "rev-parse", "HEAD", check=False)
+            wm = store.watermark(str(u["unit"]), "git") or {}
+            if not head:
+                note = "  unreadable"
+            elif wm.get("last_sha") and head != wm["last_sha"]:
+                note = f"  STALE (HEAD {head[:8]} != indexed {str(wm['last_sha'])[:8]})"
+        rows.append({**u, "stale": bool(note.strip())})
+        lines.append(f"  {u['unit']:<28} {u['event_count']:>7} events  {u['url']}{note}")
 
     lines.append("")
     for k, n in sorted(kinds.items(), key=lambda kv: -kv[1]):
@@ -112,61 +150,55 @@ def cmd_status(a) -> int:
     lines.append("")
     lines.append(f"  times shown in local time ({zone_offset()}); stored UTC")
 
-    return _out(a, {"root": root, "units": rows, "kinds": kinds}, lines)
+    return _emit(o, {"root": root, "units": rows, "kinds": kinds}, lines)
 
 
-def cmd_search(a) -> int:
-    _root_, store = _store(a)
-    where = f"unit = '{sql_str(a.unit)}'" if getattr(a, "unit", "") else ""
-    hits = store.search(a.query, limit=a.limit, where=where)
-    lines = []
+def cmd_search(o: Opts) -> int:
+    _, store = _store(o)
+    where = f"unit = '{sql_str(o.unit)}'" if o.unit else ""
+    hits = store.search(o.query, limit=o.limit, where=where)
+    lines: list[str] = []
     for h in hits:
-        first = (h.get("text") or "").strip().split("\n")[0][:96]
         lines.append(
             f"  {local_date_time(h.get('ts_commit'))}  {h.get('kind'):<16} "
-            f"{(h.get('sha') or '')[:8]:<8}  {first}"
+            f"{str(h.get('sha') or '')[:8]:<8}  {_first_line(h.get('text'), 96)}"
         )
         lines.append(f"      {h.get('uid')}")
     if not hits:
         lines.append("  no matches")
-    return _out(a, hits, lines)
+    return _emit(o, hits, lines)
 
 
-def cmd_timeline(a) -> int:
-    _root_, store = _store(a)
-    kinds = tuple(a.kind) if getattr(a, "kind", None) else ()
+def cmd_timeline(o: Opts) -> int:
+    _, store = _store(o)
     rows = store.range(
-        since=getattr(a, "since", "") or "",
-        until=getattr(a, "until", "") or "",
-        unit=getattr(a, "unit", "") or "",
-        kinds=kinds,
-        limit=a.limit,
+        since=o.since, until=o.until, unit=o.unit, kinds=o.kinds, limit=o.limit
     )
-    lines = []
+    lines: list[str] = []
     for r in rows:
         who = r.get("author_agent") or r.get("author_human") or ""
-        first = (r.get("text") or "").strip().split("\n")[0][:80]
         lines.append(
             f"  {local_date_time(r.get('ts_commit'))}  {r.get('unit'):<14} "
-            f"{r.get('kind'):<16} {who:<12} {first}"
+            f"{r.get('kind'):<16} {who:<12} {_first_line(r.get('text'), 80)}"
         )
     if not rows:
         lines.append("  no events in range")
-    return _out(a, rows, lines)
+    return _emit(o, rows, lines)
 
 
-def cmd_show(a) -> int:
-    _root_, store = _store(a)
-    ev = store.event(a.uid)
+def cmd_show(o: Opts) -> int:
+    _, store = _store(o)
+    ev = store.event(o.uid)
     if ev is None:
-        print(f"no such event: {a.uid}", file=sys.stderr)
+        print(f"no such event: {o.uid}", file=sys.stderr)
         return 1
     # Neighbours scan the unit and sort in Python. Fine per-codebase; if this ever
     # matters, the fix is a range filter around ts_commit, not an index.
-    siblings = store.range(unit=ev["unit"], limit=0)
+    siblings = store.range(unit=str(ev["unit"]), limit=0)
     idx = next((i for i, r in enumerate(siblings) if r["uid"] == ev["uid"]), -1)
     window = siblings[max(0, idx - 3) : idx + 4] if idx >= 0 else [ev]
 
+    agent = f"{ev['author_agent']} {ev['author_model']}".strip()
     lines = [
         f"uid      {ev['uid']}",
         f"unit     {ev['unit']}",
@@ -175,26 +207,41 @@ def cmd_show(a) -> int:
         f"commit   {local_date_time(ev['ts_commit'])}",
         f"sha      {ev['sha']}",
         f"human    {ev['author_human']}",
-        f"agent    {ev['author_agent']} {ev['author_model']}".rstrip(),
+        f"agent    {agent}",
         f"refs     {ev['refs']}",
         "",
-        ev["text"],
+        str(ev["text"]),
         "",
         "neighbours:",
     ]
     for r in window:
         marker = ">>" if r["uid"] == ev["uid"] else "  "
-        first = (r.get("text") or "").strip().split("\n")[0][:70]
-        lines.append(f"  {marker} {local_date_time(r['ts_commit'])}  {r['kind']:<16} {first}")
+        lines.append(
+            f"  {marker} {local_date_time(r['ts_commit'])}  "
+            f"{r['kind']:<16} {_first_line(r.get('text'), 70)}"
+        )
 
-    return _out(a, {"event": ev, "neighbours": window}, lines)
+    return _emit(o, {"event": ev, "neighbours": window}, lines)
 
 
-def cmd_exclude(a) -> int:
-    """Not in the five — a repair hatch for when the exclude line went missing."""
-    root = _root(a)
+def cmd_exclude(o: Opts) -> int:
+    """Not one of the five — a repair hatch for when the exclude line went missing."""
+    root = _root(o)
     path = ensure_excluded(root)
-    return _out(a, {"root": root, "exclude": path}, [f"registered in {path}"])
+    return _emit(o, {"root": root, "exclude": path}, [f"registered in {path}"])
+
+
+# Typed dispatch, rather than argparse's `set_defaults(func=...)`. A Namespace
+# attribute is `Any`, so calling it defeats the checker at exactly the point where the
+# whole CLI surface is decided.
+COMMANDS: dict[str, Callable[[Opts], int]] = {
+    "index": cmd_index,
+    "status": cmd_status,
+    "search": cmd_search,
+    "timeline": cmd_timeline,
+    "show": cmd_show,
+    "exclude": cmd_exclude,
+}
 
 
 # ---------------------------------------------------------------------- main
@@ -216,16 +263,13 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--no-gh", action="store_true", help="skip GitHub entirely")
     x.add_argument("--since", default="", help="only history after this date")
     x.add_argument("--full", action="store_true", help="ignore watermarks and re-read")
-    x.set_defaults(func=cmd_index)
 
-    x = sub.add_parser("status", parents=[common], help="units, counts, and staleness")
-    x.set_defaults(func=cmd_status)
+    sub.add_parser("status", parents=[common], help="units, counts, and staleness")
 
     x = sub.add_parser("search", parents=[common], help="full-text search the log")
     x.add_argument("query")
     x.add_argument("--unit", default="")
     x.add_argument("--limit", type=int, default=20)
-    x.set_defaults(func=cmd_search)
 
     x = sub.add_parser("timeline", parents=[common], help="merged chronological view")
     x.add_argument("--since", default="")
@@ -233,14 +277,12 @@ def build_parser() -> argparse.ArgumentParser:
     x.add_argument("--unit", default="")
     x.add_argument("--kind", action="append")
     x.add_argument("--limit", type=int, default=100)
-    x.set_defaults(func=cmd_timeline)
 
     x = sub.add_parser("show", parents=[common], help="one event and its neighbours")
     x.add_argument("uid")
-    x.set_defaults(func=cmd_show)
 
-    x = sub.add_parser("exclude", parents=[common], help="re-register the store in .git/info/exclude")
-    x.set_defaults(func=cmd_exclude)
+    sub.add_parser("exclude", parents=[common],
+                   help="re-register the store in .git/info/exclude")
 
     return p
 
@@ -248,7 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     a = build_parser().parse_args(argv)
     try:
-        return a.func(a)
+        return COMMANDS[str(a.cmd)](opts(a))
     except (GitError, RepoNotFound) as exc:
         print(f"{exc}", file=sys.stderr)
         return 1

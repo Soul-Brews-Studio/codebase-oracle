@@ -11,7 +11,7 @@ commit.
 from __future__ import annotations
 
 import re
-from typing import Iterator
+from collections.abc import Iterator
 
 from ..gitio import git, git_ok
 from ..ids import commit_id, file_change_id, submodule_bump_id
@@ -143,35 +143,55 @@ def _one_commit(unit: str, record: str) -> Iterator[EventRow]:
     ts_commit = to_utc_iso(ts_c)
     refs = " ".join(f"#{n}" for n in dict.fromkeys(_REFS.findall(body)))
 
-    def row(**kw) -> EventRow:
-        base = dict(
+    def row(
+        *,
+        uid: str,
+        kind: str,
+        path: str = "",
+        text: str = "",
+        insertions: int = 0,
+        deletions: int = 0,
+        from_sha: str = "",
+        to_sha: str = "",
+    ) -> EventRow:
+        """Every field named explicitly — no dict, no **kwargs.
+
+        The earlier version merged a `dict` into `EventRow(**base)`, which meant a
+        misspelled field name was only caught by Pydantic, and only if that branch
+        happened to run. Spelled out like this, a typo is a type error at author time.
+        """
+        return EventRow(
+            uid=uid,
             unit=unit,
-            sha=sha,
+            kind=kind,
             ts_author=ts_author,
             ts_commit=ts_commit,
+            sha=sha,
+            path=path,
+            text=text,
             author_human=human,
             author_agent=agent,
             author_model=model,
             refs=refs,
-            path="",
-            text="",
             number=0,
-            insertions=0,
-            deletions=0,
-            from_sha="",
-            to_sha="",
+            insertions=insertions,
+            deletions=deletions,
+            from_sha=from_sha,
+            to_sha=to_sha,
         )
-        base.update(kw)
-        return EventRow(**base)
 
     yield row(uid=commit_id(unit, sha), kind="commit", text=body, from_sha=parents.strip())
 
     # numstat carries the line counts, raw carries the modes. Join them by path.
+    # Distinct names per loop. The earlier version bound `add, dele` as strings from
+    # split() here and then rebound the same names to ints from stats.get() below —
+    # which only worked because Pydantic coerces "12" to 12 on the way in, and would
+    # have failed on the "-" that numstat writes for a binary file.
     stats: dict[str, tuple[int, int]] = {}
     for line in diff_lines:
         if _is_numstat(line):
-            add, dele, path = line.split("\t", 2)
-            stats[path] = (_num(add), _num(dele))
+            raw_add, raw_del, stat_path = line.split("\t", 2)
+            stats[stat_path] = (_num(raw_add), _num(raw_del))
 
     for line in diff_lines:
         m = _RAW.match(line)
@@ -188,14 +208,14 @@ def _one_commit(unit: str, record: str) -> Iterator[EventRow]:
                 to_sha=m["new_sha"],
             )
             continue
-        add, dele = stats.get(path, (0, 0))
+        insertions, deletions = stats.get(path, (0, 0))
         yield row(
             uid=file_change_id(unit, sha, path),
             kind="file-change",
             path=path,
             text=path,
-            insertions=add,
-            deletions=dele,
+            insertions=insertions,
+            deletions=deletions,
         )
 
 

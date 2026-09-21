@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Callable
+from collections.abc import Callable
 
 from .gitio import git
-from .models import STORE_DIRNAME, Unit, UnitRow, WatermarkRow
+from .models import GH_KINDS, GIT_KINDS, STORE_DIRNAME, Unit, UnitRow, WatermarkRow
 from .sources import gh as gh_source
 from .sources import git as git_source
 from .store import Store
@@ -91,7 +91,7 @@ def run_index(
 
         if unit.initialised:
             if full:
-                store.delete_unit_events(unit.unit)
+                store.delete_unit_events(unit.unit, GIT_KINDS)
             wm = None if full else store.watermark(unit.unit, "git")
             last_sha = (wm or {}).get("last_sha", "") or ""
             rows = list(git_source.read(unit.unit, unit.abs_path, last_sha, since))
@@ -128,7 +128,9 @@ def run_index(
                 )
             ]
         )
-        summary["units"].append({"unit": unit.unit, "written": written, "indexed": unit.initialised})
+        summary["units"].append(
+            {"unit": unit.unit, "written": written, "indexed": unit.initialised}
+        )
         summary["events"] += written
 
     store.ensure_fts_index()
@@ -139,6 +141,8 @@ def run_index(
 
 
 def _index_gh(store: Store, unit: Unit, since: str, full: bool, summary: dict) -> int:
+    if full:
+        store.delete_unit_events(unit.unit, GH_KINDS)
     wm = None if full else store.watermark(unit.unit, "gh")
     cursor = (wm or {}).get("last_cursor", "") or since
     try:
