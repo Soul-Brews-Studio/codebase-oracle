@@ -1,0 +1,35 @@
+# Indexed data NEVER belongs in git — it mirrors private repo metadata,
+# issue text, and session transcripts into a public repository.
+*.lance/
+*.lance
+data/
+.codebase-oracle/
+index/
+
+# Scratch
+.tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environment
+.env
+.env.*
+!.env.example
+.envrc
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Incubation breadcrumb
+.claude/INCUBATED_BY
